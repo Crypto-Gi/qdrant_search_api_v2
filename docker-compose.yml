@@ -1,0 +1,12 @@
+services:
+  search_api:
+    build: ./app
+    env_file: .env
+    ports:
+      - "8000:8000"
+    environment:
+      - QDRANT_HOST=${QDRANT_HOST}
+      - OLLAMA_HOST=${OLLAMA_HOST}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT}
+      - DEBUG=${DEBUG}
+    restart: unless-stopped

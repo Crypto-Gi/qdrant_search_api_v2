@@ -1,0 +1,316 @@
+from fastapi import FastAPI, HTTPException, status, Request
+from pydantic import BaseModel, Field, conint
+from typing import List, Optional, Dict, Union
+import logging
+import uvicorn
+import os
+from contextvars import ContextVar
+from pythonjsonlogger import jsonlogger
+from fastapi.middleware.cors import CORSMiddleware
+import uuid
+from dotenv import load_dotenv
+from qdrant_client import QdrantClient, models
+import ollama
+
+# ======== Configuration ========
+load_dotenv()
+QDRANT_HOST = os.getenv("QDRANT_HOST", "192.168.153.47")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "192.168.153.46")
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+# ===============================
+
+# ======== Logging Setup ========
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG if os.getenv("DEBUG") else logging.INFO)
+
+correlation_id = ContextVar("correlation_id", default="")
+
+class CorrelationIdFilter(logging.Filter):
+    def filter(self, record):
+        record.correlation_id = correlation_id.get()
+        return True
+
+formatter = jsonlogger.JsonFormatter(
+    '%(asctime)s %(levelname)s %(name)s %(correlation_id)s %(message)s'
+)
+
+handler = logging.StreamHandler()
+handler.setFormatter(formatter)
+handler.addFilter(CorrelationIdFilter())
+logger.addHandler(handler)
+# ===============================
+
+# ======== Exception Classes ========
+class SearchException(Exception):
+    """Base exception for search-related errors"""
+
+class EmbeddingError(SearchException):
+    """Exception for embedding generation failures"""
+
+class QdrantConnectionError(SearchException):
+    """Exception for Qdrant connection issues"""
+# ===============================
+
+class SearchSystem:
+    _qdrant_pool = None
+    _ollama_pool = None
+
+    def __init__(self, collection_name: str):
+        self.collection_name = collection_name
+        self.qclient = self._get_qdrant_client()
+        self.oclient = self._get_ollama_client()
+        self._ensure_collection()
+
+    @classmethod
+    def _get_qdrant_client(cls):
+        if cls._qdrant_pool is None:
+            try:
+                cls._qdrant_pool = QdrantClient(
+                    host=QDRANT_HOST,
+                    timeout=10,
+                    prefer_grpc=True
+                )
+            except Exception as e:
+                logger.error(f"Qdrant connection failed: {str(e)}")
+                raise QdrantConnectionError("Database connection error")
+        return cls._qdrant_pool
+
+    @classmethod
+    def _get_ollama_client(cls):
+        if cls._ollama_pool is None:
+            try:
+                cls._ollama_pool = ollama.Client(host=OLLAMA_HOST, timeout=10)
+            except Exception as e:
+                logger.error(f"Ollama connection failed: {str(e)}")
+                raise ConnectionError("Embedding service unavailable")
+        return cls._ollama_pool
+
+    def _ensure_collection(self):
+        if not self.qclient.collection_exists(self.collection_name):
+            self.qclient.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=models.VectorParams(
+                    size=1024,
+                    distance=models.Distance.COSINE
+                )
+            )
+            logger.info(f"Created collection '{self.collection_name}'")
+
+    def _validate_payload(self, payload: Dict) -> bool:
+        try:
+            return all([
+                isinstance(payload.get("pagecontent"), str),
+                isinstance(payload.get("metadata"), dict),
+                isinstance(payload["metadata"].get("filename"), str),
+                isinstance(payload["metadata"].get("page_number"), int),
+                0 <= payload["metadata"]["page_number"] <= 1000
+            ])
+        except KeyError:
+            return False
+
+    def _get_context_pages(self, filename: str, center_page_number: int) -> List[Dict]:
+        try:
+            page_range = models.Range(
+                gte=max(0, center_page_number - 5),
+                lte=min(1000, center_page_number + 5)
+            )
+            
+            scroll_result = self.qclient.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="metadata.filename",
+                            match=models.MatchValue(value=filename)
+                        ),
+                        models.FieldCondition(
+                            key="metadata.page_number",
+                            range=page_range
+                        )
+                    ]
+                ),
+                with_payload=True,
+                limit=11
+            )
+            
+            points = scroll_result[0]  
+            
+            return sorted([p.payload 
+                           for p in points 
+                           if self._validate_payload(p.payload)],
+                          key=lambda x: x["metadata"]["page_number"])
+        except Exception as e:
+            logger.error(f"Context retrieval failed for page {center_page_number}: {str(e)}")
+            return []
+
+    def _generate_query_embedding(self, query: str, embedding_model: str) -> List[float]:
+        try:
+            embedding = self.oclient.embeddings(
+                model=embedding_model,
+                prompt=query
+            )['embedding']
+            logger.debug(f"Generated embedding for query: {query[:50]}...")
+            return embedding
+        except Exception as e:
+            logger.error(f"Embedding generation failed: {str(e)}")
+            raise EmbeddingError("Failed to process query") from e
+
+    def batch_search(self, search_queries: List[str], filter: Optional[Dict], 
+                    limit: int = 5, embedding_model: str = "mxbai-embed-large") -> List[List[Dict]]:
+        try:
+            filter_ = None
+            if filter:
+                must_conditions = []
+                for field_path, condition in filter.items():
+                    if "match_text" in condition:
+                        must_conditions.append(
+                            models.FieldCondition(
+                                key=field_path,
+                                match=models.MatchText(text=condition["match_text"])
+                            )
+                        )
+                    elif "match_value" in condition:
+                        must_conditions.append(
+                            models.FieldCondition(
+                                key=field_path,
+                                match=models.MatchValue(value=condition["match_value"])
+                            )
+                        )
+                if must_conditions:
+                    filter_ = models.Filter(must=must_conditions)
+
+            search_requests = []
+            for query in search_queries:
+                embedding = self._generate_query_embedding(query, embedding_model)
+                search_requests.append(
+                    models.QueryRequest(
+                        query=embedding,
+                        filter=filter_,
+                        limit=limit,
+                        with_payload=True
+                    )
+                )
+
+            batch_response = self.qclient.query_batch_points(
+                collection_name=self.collection_name,
+                requests=search_requests
+            )
+
+            results = []
+            for query_response in batch_response:
+                query_results = []
+                for scored_point in query_response.points:
+                    payload = scored_point.payload
+                    if not self._validate_payload(payload):
+                        continue
+                    
+                    context_pages = self._get_context_pages(
+                        filename=payload["metadata"]["filename"],
+                        center_page_number=payload["metadata"]["page_number"]
+                    )
+                    page_numbers = [p["metadata"]["page_number"] for p in context_pages]
+                    result = {
+                        "filename": payload["metadata"]["filename"],
+                        "score": scored_point.score,
+                        "center_page": payload["metadata"]["page_number"],
+                        "combined_page": " ".join(p["pagecontent"] for p in context_pages),
+                        "page_numbers": page_numbers[:11]
+                    }
+                    query_results.append(result)
+                results.append(query_results)
+            
+            return results
+
+        except Exception as e:
+            logger.error(f"Batch search failed: {str(e)}")
+            raise SearchException("Search operation failed") from e
+
+# ======== FastAPI Setup ========
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class SearchRequest(BaseModel):
+    collection_name: str = Field(..., min_length=1, description="Name of the Qdrant collection")
+    search_queries: List[str] = Field(..., min_items=1, description="List of search queries")
+    filter: Optional[Dict[str, Dict[str, Union[str, int, float, bool]]]] = Field(None, description="Filter conditions. Each key is a metadata field path, value is a dict with 'match_text' or 'match_value'.")
+    embedding_model: Optional[str] = Field(default="mxbai-embed-large", description="Ollama embedding model name")
+    limit: Optional[conint(ge=1)] = Field(default=5, description="Maximum number of results per query")
+
+@app.middleware("http")
+async def add_correlation_id(request: Request, call_next):
+    corr_id = str(uuid.uuid4())
+    correlation_id.set(corr_id)
+    
+    logger.info("Request started", extra={
+        "path": request.url.path,
+        "method": request.method,
+        "client_ip": request.client.host if request.client else None
+    })
+    
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        logger.error(f"Request failed: {str(e)}")
+        raise
+    finally:
+        logger.info("Request completed")
+    
+    response.headers["X-Correlation-ID"] = corr_id
+    return response
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "ok",
+        "services": {
+            "qdrant": "ok" if SearchSystem._qdrant_pool else "offline",
+            "ollama": "ok" if SearchSystem._ollama_pool else "offline"
+        }
+    }
+
+@app.post("/search", status_code=status.HTTP_200_OK)
+async def search(request: Request, search_request: SearchRequest):
+    try:
+        logger.info("Search request received", extra={
+            "collection": search_request.collection_name,
+            "query_count": len(search_request.search_queries)
+        })
+        
+        system = SearchSystem(collection_name=search_request.collection_name)
+        results = system.batch_search(
+            search_queries=search_request.search_queries,
+            filter=search_request.filter,
+            limit=search_request.limit,
+            embedding_model=search_request.embedding_model
+        )
+        
+        logger.debug("Search results generated", extra={
+            "result_count": sum(len(r) for r in results)
+        })
+        return {"results": results}
+    
+    except SearchException as e:
+        logger.error(f"Search error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Search processing failed"
+        )
+    except Exception as e:
+        logger.critical(f"Unexpected error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
+
+if __name__ == "__main__":
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000,
+        timeout_keep_alive=REQUEST_TIMEOUT
+    )
