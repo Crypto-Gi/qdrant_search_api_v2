@@ -1,1 +1,22 @@
 .env
+# Ignore all .log files
+*.log
+
+# Ignore a specific file
+config.json
+
+# Ignore a directory and its contents
+/build/
+/node_modules/
+
+# Ignore all files in the logs directory but keep the directory itself
+logs/*
+
+# Ignore all .env files (commonly used for environment variables)
+.env
+
+# Ignore IDE-specific files (e.g., from VS Code)
+.vscode/
+
+# Ignore system-specific files (e.g., macOS DS_Store)
+.DS_Store
