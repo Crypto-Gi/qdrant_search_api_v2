@@ -151,47 +151,164 @@ v2 introduces significant improvements over v1:
 ## Prerequisites
 
 ### System Requirements
-- **Python**: 3.9 or higher
+- **Docker**: 20.10+ and Docker Compose v2+
 - **RAM**: Minimum 4GB (8GB+ recommended)
 - **Disk Space**: 2GB+ for models and data
+- **Network**: Access to external Qdrant and Ollama services
 
-### External Services
-- **Qdrant**: Vector database instance (self-hosted or cloud)
-  - Default port: 6333 (REST) / 6334 (gRPC)
-  - Requires at least one collection
-- **Ollama**: Embedding service
-  - Default port: 11434
-  - Must have embedding models installed (e.g., `ollama pull mxbai-embed-large`)
+### External Services (Required)
 
-### Installation Methods
+This application is designed to run as a **containerized microservice** that connects to external Qdrant and Ollama services. You must have these services running and accessible:
 
-#### Option 1: Docker Compose (Recommended for Development)
+#### **Qdrant Vector Database**
+- **Purpose**: Stores and searches vector embeddings
+- **Default Ports**: 6333 (REST API) / 6334 (gRPC)
+- **Setup Options**:
+  - Self-hosted: `docker run -p 6333:6333 qdrant/qdrant`
+  - Cloud: Qdrant Cloud service
+  - Local: Download from https://qdrant.tech/
+- **Requirements**: At least one collection must exist
+
+#### **Ollama Embedding Service**
+- **Purpose**: Generates vector embeddings from text
+- **Default Port**: 11434
+- **Setup**: 
+  ```bash
+  # Install Ollama
+  curl -fsSL https://ollama.ai/install.sh | sh
+  
+  # Pull embedding models
+  ollama pull mxbai-embed-large
+  ollama pull bge-m3
+  ```
+- **Requirements**: At least one embedding model installed
+
+---
+
+## Quick Start with Docker (Recommended)
+
+### Step 1: Clone and Configure
 ```bash
+# Clone the repository
+git clone https://github.com/Crypto-Gi/qdrant_search_api_v2.git
+cd qdrant_search_api_v2
+
+# Create environment configuration
+cp tamplate.env .env
+```
+
+### Step 2: Configure External Services
+Edit `.env` file with your service endpoints:
+```bash
+# External Services Configuration
+QDRANT_HOST=192.168.1.100    # Your Qdrant server IP
+OLLAMA_HOST=192.168.1.101     # Your Ollama server IP
+
+# Application Settings
+DEBUG=false
+REQUEST_TIMEOUT=30
+CONTEXT_WINDOW_SIZE=5
+```
+
+### Step 3: Start the API Container
+```bash
+# Using Docker Compose (Recommended)
 docker-compose up -d
-```
 
-#### Option 2: Manual Installation
-```bash
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r app/requirements.txt
-
-# Start the service
-cd app
-uvicorn main:app --host 0.0.0.0 --port 8000
-```
-
-#### Option 3: Docker Container
-```bash
+# Or using Docker directly
 docker build -t qdrant-search-api-v2 ./app
 docker run -d \
   -p 8000:8000 \
   --env-file .env \
   --name qdrant-search-api-v2 \
   qdrant-search-api-v2
+```
+
+### Step 4: Verify Installation
+```bash
+# Check container status
+docker-compose ps
+
+# Test health endpoint
+curl http://localhost:8000/health
+
+# View logs
+docker-compose logs -f search_api
+```
+
+---
+
+## Installation Methods
+
+### Method 1: Docker Compose (Production Recommended)
+
+**Best for**: Production deployments, development environments
+
+```bash
+# 1. Clone and configure
+git clone https://github.com/Crypto-Gi/qdrant_search_api_v2.git
+cd qdrant_search_api_v2
+cp tamplate.env .env
+
+# 2. Edit .env with your service IPs
+nano .env
+
+# 3. Start the service
+docker-compose up -d
+
+# 4. Verify
+curl http://localhost:8000/health
+```
+
+### Method 2: Docker Build (Custom Deployments)
+
+**Best for**: Custom container orchestration, Kubernetes
+
+```bash
+# 1. Clone repository
+git clone https://github.com/Crypto-Gi/qdrant_search_api_v2.git
+cd qdrant_search_api_v2
+
+# 2. Build container
+docker build -t qdrant-search-api-v2 ./app
+
+# 3. Run with environment variables
+docker run -d \
+  -p 8000:8000 \
+  -e QDRANT_HOST=your-qdrant-host \
+  -e OLLAMA_HOST=your-ollama-host \
+  -e DEBUG=false \
+  --name qdrant-search-api-v2 \
+  qdrant-search-api-v2
+```
+
+### Method 3: Manual Installation (Development Only)
+
+**Best for**: Local development, debugging
+
+```bash
+# 1. Prerequisites
+python --version  # Requires 3.9+
+pip --version
+
+# 2. Clone and setup
+git clone https://github.com/Crypto-Gi/qdrant_search_api_v2.git
+cd qdrant_search_api_v2
+
+# 3. Create virtual environment
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+
+# 4. Install dependencies
+pip install -r app/requirements.txt
+
+# 5. Configure environment
+cp tamplate.env .env
+# Edit .env with your service IPs
+
+# 6. Start development server
+cd app
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 ---
@@ -1529,56 +1646,313 @@ Error: Collection 'my_collection' not found
 
 #### Container Fails to Start
 ```bash
-# Check logs
+# Check container logs
+docker-compose logs search_api
+# OR
 docker logs qdrant-search-api-v2
+
+# Check container status
+docker-compose ps
+# OR
+docker ps -a
 
 # Verify image exists
 docker images | grep qdrant
 
 # Rebuild image
-docker build -t qdrant-search-api-v2 ./app
+docker-compose build --no-cache
+# OR
+docker build -t qdrant-search-api-v2 ./app --no-cache
+```
+
+#### Container Starts But Health Check Fails
+```bash
+# Check if container is running
+docker-compose ps
+
+# Test container network connectivity
+docker-compose exec search_api ping qdrant-host
+docker-compose exec search_api ping ollama-host
+
+# Check environment variables
+docker-compose exec search_api env | grep -E "(QDRANT|OLLAMA)"
+
+# Test external services from container
+docker-compose exec search_api curl http://$QDRANT_HOST:6333/collections
+docker-compose exec search_api curl http://$OLLAMA_HOST:11434/api/tags
 ```
 
 #### Port Already in Use
 ```bash
 # Find process using port 8000
 lsof -i :8000
+# OR
+netstat -tulpn | grep 8000
 
 # Kill process
 kill -9 <PID>
 
-# Or use different port
-docker run -p 8001:8000 ...
+# Or use different port in docker-compose.yml
+ports:
+  - "8001:8000"  # Host:Container
+```
+
+#### External Service Connection Issues
+```bash
+# Test connectivity from host
+ping $QDRANT_HOST
+ping $OLLAMA_HOST
+
+# Test service endpoints
+curl http://$QDRANT_HOST:6333/collections
+curl http://$OLLAMA_HOST:11434/api/tags
+
+# Check firewall rules
+sudo ufw status  # Ubuntu
+sudo firewall-cmd --list-all  # CentOS/RHEL
+
+# Verify Docker network
+docker network ls
+docker network inspect qdrant_search_api_v2_default
+```
+
+#### Environment Variable Issues
+```bash
+# Check .env file exists and is readable
+ls -la .env
+cat .env
+
+# Verify environment variables in container
+docker-compose exec search_api env
+
+# Test with explicit environment variables
+docker run -it --rm \
+  -e QDRANT_HOST=192.168.1.100 \
+  -e OLLAMA_HOST=192.168.1.101 \
+  -e DEBUG=true \
+  qdrant-search-api-v2 python -c "import os; print(f'Qdrant: {os.getenv(\"QDRANT_HOST\")}')"
+```
+
+#### Container Resource Issues
+```bash
+# Check container resource usage
+docker stats qdrant-search-api-v2
+
+# Check available system resources
+free -h  # Memory
+df -h    # Disk space
+
+# Increase container resources (if using Docker Desktop)
+# Go to Docker Desktop > Settings > Resources
+```
+
+---
+
+## Container Management
+
+### Docker Compose Commands
+
+#### Basic Operations
+```bash
+# Start services
+docker-compose up -d
+
+# Stop services
+docker-compose down
+
+# Restart services
+docker-compose restart
+
+# View status
+docker-compose ps
+
+# View logs
+docker-compose logs -f search_api
+
+# Rebuild and restart
+docker-compose up -d --build
+```
+
+#### Development Operations
+```bash
+# Start with live logs
+docker-compose up
+
+# Start specific service
+docker-compose up search_api
+
+# Execute commands in container
+docker-compose exec search_api bash
+docker-compose exec search_api python -c "import sys; print(sys.version)"
+
+# View environment variables
+docker-compose exec search_api env
+
+# Copy files to/from container
+docker-compose cp local_file.txt search_api:/app/
+docker-compose cp search_api:/app/logs/app.log ./
+```
+
+#### Maintenance Operations
+```bash
+# Update container image
+docker-compose pull
+docker-compose up -d
+
+# Clean up unused resources
+docker system prune -f
+
+# View resource usage
+docker-compose exec search_api top
+docker stats $(docker-compose ps -q)
+
+# Backup container data (if any volumes)
+docker-compose exec search_api tar czf /tmp/backup.tar.gz /app/data
+docker-compose cp search_api:/tmp/backup.tar.gz ./backup.tar.gz
+```
+
+### Direct Docker Commands
+
+#### Container Lifecycle
+```bash
+# Build image
+docker build -t qdrant-search-api-v2 ./app
+
+# Run container
+docker run -d \
+  --name qdrant-search-api-v2 \
+  -p 8000:8000 \
+  --env-file .env \
+  qdrant-search-api-v2
+
+# Stop container
+docker stop qdrant-search-api-v2
+
+# Start existing container
+docker start qdrant-search-api-v2
+
+# Remove container
+docker rm qdrant-search-api-v2
+
+# Remove image
+docker rmi qdrant-search-api-v2
+```
+
+#### Container Inspection
+```bash
+# View container logs
+docker logs qdrant-search-api-v2 -f
+
+# Execute commands in container
+docker exec -it qdrant-search-api-v2 bash
+docker exec qdrant-search-api-v2 curl http://localhost:8000/health
+
+# Inspect container configuration
+docker inspect qdrant-search-api-v2
+
+# View container resource usage
+docker stats qdrant-search-api-v2
 ```
 
 ---
 
 ## Development
 
-### Running in Development Mode
+### Development with Docker (Recommended)
 ```bash
+# 1. Start development environment
+docker-compose up -d
+
+# 2. Make code changes in ./app/
+
+# 3. Rebuild and restart
+docker-compose up -d --build
+
+# 4. View logs
+docker-compose logs -f search_api
+
+# 5. Test changes
+curl http://localhost:8000/health
+```
+
+### Local Development (Manual)
+```bash
+# 1. Setup environment
 cd app
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# 2. Configure environment
+cp ../tamplate.env ../.env
+# Edit .env with service IPs
+
+# 3. Start development server
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 ### Debugging
+
+#### Container Debugging
+```bash
+# Enable debug logging in container
+docker-compose exec search_api \
+  python -c "import os; os.environ['DEBUG']='true'; exec(open('main.py').read())"
+
+# View detailed logs
+docker-compose logs -f search_api
+
+# Interactive debugging
+docker-compose exec search_api python -i main.py
+```
+
+#### Local Debugging
 ```bash
 # Enable debug logging
 DEBUG=true uvicorn main:app --reload
+
+# Python debugger
+python -m pdb app/main.py
 
 # View detailed logs
 tail -f logs/app.log
 ```
 
 ### Testing
+
+#### Health Check Tests
 ```bash
-# Health check
+# Test health endpoint
 curl http://localhost:8000/health
 
-# Simple search
+# Test from inside container
+docker-compose exec search_api curl http://localhost:8000/health
+
+# Test external service connectivity
+docker-compose exec search_api curl http://$QDRANT_HOST:6333/collections
+docker-compose exec search_api curl http://$OLLAMA_HOST:11434/api/tags
+```
+
+#### API Tests
+```bash
+# Simple search test
 curl -X POST http://localhost:8000/simple-search \
   -H "Content-Type: application/json" \
-  -d '{"collection_name":"test","queries":["test"]}'
+  -d '{
+    "collection_name": "test_collection",
+    "queries": ["test query"],
+    "limit": 3
+  }'
+
+# Standard search test
+curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "collection_name": "test_collection",
+    "search_queries": ["test query"],
+    "limit": 3,
+    "context_window_size": 2
+  }'
 ```
 
 ---
